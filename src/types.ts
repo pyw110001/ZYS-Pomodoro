@@ -2,6 +2,9 @@ export type FocusMode = 'pomodoro' | 'countup'
 export type SessionStatus = 'running' | 'paused' | 'completed' | 'abandoned'
 export type Rarity = 'common' | 'rare' | 'special'
 export type RoomSlot = 'rug' | 'cushion' | 'leftDecor' | 'rightDecor'
+export type Locale = 'zh-CN' | 'en-US'
+export type SoundChoice = 'off' | 'rain' | 'purr' | 'custom'
+export type StarterTaskKey = 'research' | 'assets' | 'reading'
 
 export interface FocusSession {
   id: string
@@ -25,11 +28,11 @@ export interface FocusTask {
   createdAt: number
   dueDate?: string
   focusMinutes: number
+  titleKey?: StarterTaskKey
 }
 
 export interface CatalogItem {
   id: string
-  name: string
   rarity: Rarity
   price: number
   slot: RoomSlot
@@ -51,10 +54,11 @@ export interface RoomLayout {
 
 export interface AppSettings {
   id: 'settings'
-  locale: 'zh-CN'
+  locale: Locale
   pomodoroMinutes: number
   breakMinutes: number
-  sound: 'off' | 'rain' | 'purr'
+  sound: SoundChoice
+  customSoundId?: string
   volume: number
   reducedMotion: boolean
 }
@@ -65,7 +69,16 @@ export interface AppMeta {
   activeSessionId?: string
   activeTaskId?: string
   roomLayout: RoomLayout
-  schemaVersion: 1
+  schemaVersion: 1 | 2
+}
+
+export interface CustomSound {
+  id: string
+  name: string
+  mimeType: string
+  size: number
+  blob: Blob
+  createdAt: number
 }
 
 export interface CompletionNotice {
@@ -77,11 +90,19 @@ export interface CompletionNotice {
 }
 
 export interface ExportPayload {
-  version: 1
+  version: 2
   exportedAt: number
   sessions: FocusSession[]
   tasks: FocusTask[]
   inventory: InventoryEntry[]
   settings: AppSettings
   meta: AppMeta
+}
+
+export interface LegacyExportPayload extends Omit<ExportPayload, 'version' | 'settings'> {
+  version: 1
+  settings: Omit<AppSettings, 'locale' | 'sound' | 'customSoundId'> & {
+    locale: 'zh-CN'
+    sound: 'off' | 'rain' | 'purr'
+  }
 }
