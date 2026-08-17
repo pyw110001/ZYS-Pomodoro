@@ -1,5 +1,5 @@
 import type { FocusSession } from '../types'
-import { zhCN } from '../i18n/zh-CN'
+import type { Locale } from '../types'
 
 export interface DayStat {
   date: Date
@@ -32,13 +32,13 @@ export function summarizeDay(sessions: FocusSession[], day = new Date()) {
   }
 }
 
-export function aggregateLastSevenDays(sessions: FocusSession[], now = new Date()): DayStat[] {
-  const dayNames = zhCN.stats.days
+export function aggregateLastSevenDays(sessions: FocusSession[], now = new Date(), locale: Locale = 'zh-CN'): DayStat[] {
+  const weekday = new Intl.DateTimeFormat(locale, { weekday: 'short' })
   return Array.from({ length: 7 }, (_, index) => {
     const date = new Date(now)
     date.setHours(0, 0, 0, 0)
     date.setDate(date.getDate() - (6 - index))
     const daily = sessionsForDay(sessions, date)
-    return { date, label: dayNames[date.getDay()], minutes: completedMinutes(daily) }
+    return { date, label: weekday.format(date), minutes: completedMinutes(daily) }
   })
 }

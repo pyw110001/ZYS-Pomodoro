@@ -1,10 +1,14 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type PropsWithChildren } from 'react'
 import { catalogById } from '../data/catalog'
 import { db, defaultMeta, defaultSettings, exportDatabase, importDatabase, resetDatabase, seedDatabase } from '../data/db'
+import { getCatalogName, getMessages, getTaskTitle } from '../i18n'
+import type { Messages } from '../i18n/zh-CN'
+import { validateAudioFile } from '../lib/customAudio'
 import { fishForMinutes, pickReward } from '../lib/rewards'
 import { getElapsedMs, getElapsedSeconds, isCountdownComplete } from '../lib/timer'
-import type { AppMeta, AppSettings, CompletionNotice, ExportPayload, FocusMode, FocusSession, FocusTask, InventoryEntry, RoomSlot } from '../types'
-import { zhCN } from '../i18n/zh-CN'
+import type { AppMeta, AppSettings, CompletionNotice, CustomSound, ExportPayload, FocusMode, FocusSession, FocusTask, InventoryEntry, LegacyExportPayload, RoomSlot, SoundChoice } from '../types'
+
+export type AmbientPlaybackStatus = 'idle' | 'playing' | 'paused' | 'blocked' | 'error'
 
 interface AppContextValue {
   loaded: boolean
@@ -15,6 +19,10 @@ interface AppContextValue {
   inventory: InventoryEntry[]
   meta: AppMeta
   settings: AppSettings
+  m: Messages
+  customSounds: CustomSound[]
+  ambientStatus: AmbientPlaybackStatus
+  ambientError?: 'blocked' | 'unsupported'
   activeSession?: FocusSession
   completion?: CompletionNotice
   toast?: string
@@ -31,6 +39,14 @@ interface AppContextValue {
   exchangeItem(itemId: string): Promise<void>
   equipItem(itemId: string): Promise<void>
   updateSettings(patch: Partial<AppSettings>): Promise<void>
+  taskTitle(task: FocusTask): string
+  catalogName(itemId: string): string
+  selectSound(sound: SoundChoice, customSoundId?: string): Promise<void>
+  pauseAmbient(): void
+  resumeAmbient(): void
+  addCustomSound(file: File): Promise<void>
+  renameCustomSound(id: string, name: string): Promise<void>
+  deleteCustomSound(id: string): Promise<void>
   requestNotifications(): Promise<NotificationPermission | 'unsupported'>
   downloadExport(): Promise<void>
   restoreImport(file: File): Promise<void>
@@ -49,24 +65,34 @@ export function AppProvider({ children }: PropsWithChildren) {
   const [inventory, setInventory] = useState<InventoryEntry[]>([])
   const [meta, setMeta] = useState<AppMeta>(defaultMeta)
   const [settings, setSettings] = useState<AppSettings>(defaultSettings)
+  const [customSounds, setCustomSounds] = useState<CustomSound[]>([])
+  const [ambientStatus, setAmbientStatus] = useState<AmbientPlaybackStatus>('idle')
+  const [ambientError, setAmbientError] = useState<'blocked' | 'unsupported'>()
+  const [audioArmed, setAudioArmed] = useState(false)
   const [completion, setCompletion] = useState<CompletionNotice>()
   const [toast, setToast] = useState<string>()
   const wakeLockRef = useRef<WakeLockSentinel | null>(null)
   const completingRef = useRef(false)
+  const audioCleanupRef = useRef<(() => void) | null>(null)
+  const audioElementRef = useRef<HTMLAudioElement | null>(null)
+  const audioGainRef = useRef<GainNode | null>(null)
+  const m = useMemo(() => getMessages(settings.locale), [settings.locale])
 
   const refresh = useCallback(async () => {
-    const [nextTasks, nextSessions, nextInventory, nextMeta, nextSettings] = await Promise.all([
+    const [nextTasks, nextSessions, nextInventory, nextMeta, nextSettings, nextCustomSounds] = await Promise.all([
       db.tasks.orderBy('createdAt').reverse().toArray(),
       db.sessions.orderBy('startedAt').reverse().toArray(),
       db.inventory.toArray(),
       db.meta.get('app'),
-      db.settings.get('settings')
+      db.settings.get('settings'),
+      db.customSounds.orderBy('createdAt').reverse().toArray()
     ])
     setTasks(nextTasks)
     setSessions(nextSessions)
     if (nextMeta) setMeta(nextMeta)
     if (nextSettings) setSettings(nextSettings)
     setInventory(nextInventory)
+    setCustomSounds(nextCustomSounds)
   }, [])
 
   const notifyPeers = useCallback(() => channel?.postMessage({ type: 'refresh' }), [])
@@ -78,7 +104,7 @@ export function AppProvider({ children }: PropsWithChildren) {
   useEffect(() => {
     seedDatabase()
       .then(refresh)
-      .catch(() => setStorageError(zhCN.system.storageUnavailable))
+      .catch(() => setStorageError(getMessages(defaultSettings.locale).system.storageUnavailable))
       .finally(() => setLoaded(true))
     const timer = window.setInterval(() => setNow(Date.now()), 500)
     const handleChannel = () => refresh()
@@ -91,8 +117,93 @@ export function AppProvider({ children }: PropsWithChildren) {
 
   useEffect(() => {
     document.documentElement.dataset.reduceMotion = settings.reducedMotion ? 'true' : 'false'
+    document.documentElement.lang = settings.locale
+    document.title = m.brand
     return () => { delete document.documentElement.dataset.reduceMotion }
-  }, [settings.reducedMotion])
+  }, [m.brand, settings.locale, settings.reducedMotion])
+
+  useEffect(() => {
+    if (audioElementRef.current) audioElementRef.current.volume = settings.volume
+    if (audioGainRef.current) audioGainRef.current.gain.value = settings.volume * 0.16
+  }, [settings.volume])
+
+  useEffect(() => {
+    audioCleanupRef.current?.()
+    audioCleanupRef.current = null
+    audioElementRef.current = null
+    audioGainRef.current = null
+    setAmbientError(undefined)
+
+    if (!audioArmed || settings.sound === 'off') {
+      setAmbientStatus(settings.sound === 'off' ? 'idle' : 'paused')
+      return
+    }
+
+    let cancelled = false
+    const start = async () => {
+      if (settings.sound === 'custom') {
+        const custom = settings.customSoundId ? await db.customSounds.get(settings.customSoundId) : undefined
+        if (!custom) {
+          setAmbientStatus('error')
+          setAmbientError('unsupported')
+          return
+        }
+        const url = URL.createObjectURL(custom.blob)
+        const audio = new Audio(url)
+        audio.loop = true
+        audio.volume = settings.volume
+        audioElementRef.current = audio
+        audioCleanupRef.current = () => { audio.pause(); audio.removeAttribute('src'); audio.load(); URL.revokeObjectURL(url) }
+        try {
+          await audio.play()
+          if (!cancelled) setAmbientStatus('playing')
+        } catch (reason) {
+          if (cancelled) return
+          const name = reason instanceof DOMException ? reason.name : ''
+          setAmbientError(name === 'NotAllowedError' ? 'blocked' : 'unsupported')
+          setAmbientStatus(name === 'NotAllowedError' ? 'blocked' : 'error')
+        }
+        return
+      }
+
+      const AudioContextType = window.AudioContext ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+      if (!AudioContextType) {
+        setAmbientError('unsupported')
+        setAmbientStatus('error')
+        return
+      }
+      const context = new AudioContextType()
+      const master = context.createGain()
+      master.gain.value = settings.volume * 0.16
+      master.connect(context.destination)
+      audioGainRef.current = master
+      if (settings.sound === 'rain') {
+        const buffer = context.createBuffer(1, context.sampleRate * 2, context.sampleRate)
+        const data = buffer.getChannelData(0)
+        for (let index = 0; index < data.length; index += 1) data[index] = Math.random() * 2 - 1
+        const source = context.createBufferSource()
+        const filter = context.createBiquadFilter()
+        source.buffer = buffer; source.loop = true; filter.type = 'lowpass'; filter.frequency.value = 1400
+        source.connect(filter).connect(master); source.start()
+      } else {
+        const oscillator = context.createOscillator()
+        const lfo = context.createOscillator()
+        const lfoGain = context.createGain()
+        oscillator.type = 'sine'; oscillator.frequency.value = 68
+        lfo.frequency.value = 4.2; lfoGain.gain.value = 0.35
+        lfo.connect(lfoGain).connect(master.gain); oscillator.connect(master); oscillator.start(); lfo.start()
+      }
+      audioCleanupRef.current = () => void context.close()
+      try {
+        if (context.state === 'suspended') await context.resume()
+        if (!cancelled) setAmbientStatus('playing')
+      } catch {
+        if (!cancelled) { setAmbientError('blocked'); setAmbientStatus('blocked') }
+      }
+    }
+    void start()
+    return () => { cancelled = true; audioCleanupRef.current?.(); audioCleanupRef.current = null }
+  }, [audioArmed, settings.customSoundId, settings.sound])
 
   const activeSession = useMemo(
     () => sessions.find((session) => session.id === meta.activeSessionId && (session.status === 'running' || session.status === 'paused')),
@@ -105,9 +216,9 @@ export function AppProvider({ children }: PropsWithChildren) {
         wakeLockRef.current = await navigator.wakeLock.request('screen')
       }
     } catch {
-      flash(zhCN.system.wakeLock)
+      flash(m.system.wakeLock)
     }
-  }, [flash])
+  }, [flash, m.system.wakeLock])
 
   const releaseWakeLock = useCallback(async () => {
     try { await wakeLockRef.current?.release() } catch { /* already released */ }
@@ -120,7 +231,7 @@ export function AppProvider({ children }: PropsWithChildren) {
     try {
       const elapsedMinutes = Math.max(1, Math.floor(getElapsedMs(session) / 60000))
       if (session.mode === 'countup' && elapsedMinutes < 10) {
-        flash(zhCN.system.countupShort)
+        flash(m.system.countupShort)
         return
       }
 
@@ -155,12 +266,13 @@ export function AppProvider({ children }: PropsWithChildren) {
       if (notice) {
         setCompletion(notice)
         if ('Notification' in window && Notification.permission === 'granted' && document.hidden) {
-          const notification = { body: zhCN.system.notificationBody(notice.item.name, notice.fishDelta) }
+          const itemName = getCatalogName(notice.item.id, settings.locale)
+          const notification = { body: m.system.notificationBody(itemName, notice.fishDelta) }
           if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
             navigator.serviceWorker.ready
-              .then((registration) => registration.showNotification(zhCN.system.focusComplete, notification))
-              .catch(() => new Notification(zhCN.system.focusComplete, notification))
-          } else new Notification(zhCN.system.focusComplete, notification)
+              .then((registration) => registration.showNotification(m.system.focusComplete, notification))
+              .catch(() => new Notification(m.system.focusComplete, notification))
+          } else new Notification(m.system.focusComplete, notification)
         }
       }
       await releaseWakeLock()
@@ -169,7 +281,7 @@ export function AppProvider({ children }: PropsWithChildren) {
     } finally {
       completingRef.current = false
     }
-  }, [flash, notifyPeers, refresh, releaseWakeLock])
+  }, [flash, m, notifyPeers, refresh, releaseWakeLock, settings.locale])
 
   useEffect(() => {
     if (activeSession && isCountdownComplete(activeSession, now)) void completeSession(activeSession)
@@ -180,22 +292,22 @@ export function AppProvider({ children }: PropsWithChildren) {
       if (!activeSession) return
       if (document.hidden) {
         await db.sessions.update(activeSession.id, { hiddenCount: activeSession.hiddenCount + 1 })
-        flash(zhCN.system.hidden)
+        flash(m.system.hidden)
       } else if (activeSession.status === 'running') {
         await acquireWakeLock()
       }
     }
     document.addEventListener('visibilitychange', handleVisibility)
     return () => document.removeEventListener('visibilitychange', handleVisibility)
-  }, [acquireWakeLock, activeSession, flash])
+  }, [acquireWakeLock, activeSession, flash, m.system.hidden])
 
   const startSession = useCallback(async (mode: FocusMode, minutes: number, taskId?: string) => {
     await db.transaction('rw', [db.sessions, db.meta], async () => {
       const currentMeta = await db.meta.get('app')
-      if (!currentMeta) throw new Error(zhCN.system.initializing)
+      if (!currentMeta) throw new Error(m.system.initializing)
       if (currentMeta.activeSessionId) {
         const current = await db.sessions.get(currentMeta.activeSessionId)
-        if (current && (current.status === 'running' || current.status === 'paused')) throw new Error(zhCN.system.anotherTab)
+        if (current && (current.status === 'running' || current.status === 'paused')) throw new Error(m.system.anotherTab)
       }
       const timestamp = Date.now()
       const session: FocusSession = {
@@ -209,7 +321,7 @@ export function AppProvider({ children }: PropsWithChildren) {
     await acquireWakeLock()
     await refresh()
     notifyPeers()
-  }, [acquireWakeLock, notifyPeers, refresh])
+  }, [acquireWakeLock, m.system.anotherTab, m.system.initializing, notifyPeers, refresh])
 
   const pauseSession = useCallback(async () => {
     if (!activeSession || activeSession.status !== 'running') return
@@ -234,9 +346,9 @@ export function AppProvider({ children }: PropsWithChildren) {
       await db.meta.update('app', { activeSessionId: undefined })
     })
     await releaseWakeLock()
-    flash(elapsed < 15 ? zhCN.system.accidentalCancel : zhCN.system.abandoned)
+    flash(elapsed < 15 ? m.system.accidentalCancel : m.system.abandoned)
     await refresh(); notifyPeers()
-  }, [activeSession, flash, notifyPeers, refresh, releaseWakeLock])
+  }, [activeSession, flash, m.system.abandoned, m.system.accidentalCancel, notifyPeers, refresh, releaseWakeLock])
 
   const finishCountup = useCallback(async () => {
     if (activeSession?.mode === 'countup') await completeSession(activeSession)
@@ -247,7 +359,11 @@ export function AppProvider({ children }: PropsWithChildren) {
     await refresh(); notifyPeers()
   }, [notifyPeers, refresh])
 
-  const updateTask = useCallback(async (task: FocusTask) => { await db.tasks.put(task); await refresh(); notifyPeers() }, [notifyPeers, refresh])
+  const updateTask = useCallback(async (task: FocusTask) => {
+    const current = await db.tasks.get(task.id)
+    await db.tasks.put({ ...task, titleKey: current?.title === task.title ? current.titleKey : undefined })
+    await refresh(); notifyPeers()
+  }, [notifyPeers, refresh])
   const deleteTask = useCallback(async (id: string) => { await db.tasks.delete(id); await refresh(); notifyPeers() }, [notifyPeers, refresh])
   const selectTask = useCallback(async (id?: string) => { await db.meta.update('app', { activeTaskId: id }); await refresh(); notifyPeers() }, [notifyPeers, refresh])
 
@@ -257,12 +373,12 @@ export function AppProvider({ children }: PropsWithChildren) {
     await db.transaction('rw', [db.inventory, db.meta], async () => {
       const [owned, currentMeta] = await Promise.all([db.inventory.get(itemId), db.meta.get('app')])
       if (owned || !currentMeta) return
-      if (currentMeta.fishBalance < item.price) throw new Error(zhCN.system.notEnoughFish)
+      if (currentMeta.fishBalance < item.price) throw new Error(m.system.notEnoughFish)
       await db.inventory.put({ itemId, quantity: 1, unlockedAt: Date.now() })
       await db.meta.update('app', { fishBalance: currentMeta.fishBalance - item.price })
     })
     await refresh(); notifyPeers()
-  }, [notifyPeers, refresh])
+  }, [m.system.notEnoughFish, notifyPeers, refresh])
 
   const equipItem = useCallback(async (itemId: string) => {
     const item = catalogById[itemId]
@@ -278,6 +394,51 @@ export function AppProvider({ children }: PropsWithChildren) {
     await refresh(); notifyPeers()
   }, [notifyPeers, refresh])
 
+  const taskTitle = useCallback((task: FocusTask) => getTaskTitle(task, settings.locale), [settings.locale])
+  const catalogName = useCallback((itemId: string) => getCatalogName(itemId, settings.locale), [settings.locale])
+
+  const selectSound = useCallback(async (sound: SoundChoice, customSoundId?: string) => {
+    await updateSettings({ sound, customSoundId: sound === 'custom' ? customSoundId : undefined })
+    setAudioArmed(sound !== 'off')
+  }, [updateSettings])
+
+  const pauseAmbient = useCallback(() => setAudioArmed(false), [])
+  const resumeAmbient = useCallback(() => {
+    if (settings.sound !== 'off') setAudioArmed(true)
+  }, [settings.sound])
+
+  const addCustomSound = useCallback(async (file: File) => {
+    const error = validateAudioFile(file, customSounds)
+    if (error) {
+      const message = error === 'type' ? m.system.audioType : error === 'file-size' ? m.system.audioTooLarge : error === 'count' ? m.system.audioCount : m.system.audioTotal
+      throw new Error(message)
+    }
+    const sound: CustomSound = { id: crypto.randomUUID(), name: file.name, mimeType: file.type || 'audio/*', size: file.size, blob: file, createdAt: Date.now() }
+    try { await db.customSounds.put(sound) }
+    catch (reason) {
+      if (reason instanceof DOMException && reason.name === 'QuotaExceededError') throw new Error(m.system.audioQuota)
+      throw reason
+    }
+    await refresh(); notifyPeers(); flash(m.system.audioSaved)
+    await selectSound('custom', sound.id)
+  }, [customSounds, flash, m.system, notifyPeers, refresh, selectSound])
+
+  const renameCustomSound = useCallback(async (id: string, name: string) => {
+    const trimmed = name.trim()
+    if (!trimmed) return
+    await db.customSounds.update(id, { name: trimmed })
+    await refresh(); notifyPeers()
+  }, [notifyPeers, refresh])
+
+  const deleteCustomSound = useCallback(async (id: string) => {
+    await db.customSounds.delete(id)
+    if (settings.customSoundId === id) {
+      setAudioArmed(false)
+      await db.settings.update('settings', { sound: 'off', customSoundId: undefined })
+    }
+    await refresh(); notifyPeers(); flash(m.system.audioDeleted)
+  }, [flash, m.system.audioDeleted, notifyPeers, refresh, settings.customSoundId])
+
   const requestNotifications = useCallback(async () => {
     if (!('Notification' in window)) return 'unsupported' as const
     return Notification.requestPermission()
@@ -292,21 +453,28 @@ export function AppProvider({ children }: PropsWithChildren) {
   }, [])
 
   const restoreImport = useCallback(async (file: File) => {
-    const payload = JSON.parse(await file.text()) as ExportPayload
-    await importDatabase(payload)
-    await refresh(); notifyPeers(); flash(zhCN.system.restored)
-  }, [flash, notifyPeers, refresh])
+    const payload = JSON.parse(await file.text()) as ExportPayload | LegacyExportPayload
+    try { await importDatabase(payload) }
+    catch (reason) {
+      if (reason instanceof Error && reason.message === 'UNSUPPORTED_DATA') throw new Error(m.system.unsupportedData)
+      throw reason
+    }
+    setAudioArmed(false)
+    await refresh(); notifyPeers(); flash(m.system.restored)
+  }, [flash, m.system.restored, m.system.unsupportedData, notifyPeers, refresh])
 
   const resetAll = useCallback(async () => {
-    await resetDatabase(); await refresh(); notifyPeers(); setCompletion(undefined); flash(zhCN.system.reset)
-  }, [flash, notifyPeers, refresh])
+    setAudioArmed(false)
+    await resetDatabase(); await refresh(); notifyPeers(); setCompletion(undefined); flash(m.system.reset)
+  }, [flash, m.system.reset, notifyPeers, refresh])
 
   const value = useMemo<AppContextValue>(() => ({
-    loaded, storageError, now, tasks, sessions, inventory, meta, settings, activeSession, completion, toast,
+    loaded, storageError, now, tasks, sessions, inventory, meta, settings, m, customSounds, ambientStatus, ambientError, activeSession, completion, toast,
     clearCompletion: () => setCompletion(undefined), startSession, pauseSession, resumeSession, abandonSession,
     finishCountup, createTask, updateTask, deleteTask, selectTask, exchangeItem, equipItem, updateSettings,
+    taskTitle, catalogName, selectSound, pauseAmbient, resumeAmbient, addCustomSound, renameCustomSound, deleteCustomSound,
     requestNotifications, downloadExport, restoreImport, resetAll
-  }), [loaded, storageError, now, tasks, sessions, inventory, meta, settings, activeSession, completion, toast, startSession, pauseSession, resumeSession, abandonSession, finishCountup, createTask, updateTask, deleteTask, selectTask, exchangeItem, equipItem, updateSettings, requestNotifications, downloadExport, restoreImport, resetAll])
+  }), [loaded, storageError, now, tasks, sessions, inventory, meta, settings, m, customSounds, ambientStatus, ambientError, activeSession, completion, toast, startSession, pauseSession, resumeSession, abandonSession, finishCountup, createTask, updateTask, deleteTask, selectTask, exchangeItem, equipItem, updateSettings, taskTitle, catalogName, selectSound, pauseAmbient, resumeAmbient, addCustomSound, renameCustomSound, deleteCustomSound, requestNotifications, downloadExport, restoreImport, resetAll])
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>
 }
